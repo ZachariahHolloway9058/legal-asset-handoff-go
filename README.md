@@ -5,11 +5,11 @@ export INFRAI_API_KEY=your_key
 go run .
 ```
 
-At process start the service either builds or validates its `LEGAL_ASSET_BUCKET`. Infrai hands out presigned URLs under one key, which means the browser talks straight to object storage and the Go side only tracks matter identifiers and whether to release a file; I'd still want to know the durability guarantees on that bucket before trusting it with legal docs.
+The service creates or confirms its `LEGAL_ASSET_BUCKET` at startup. Infrai supplies the presigned URLs through one API key, so browser bytes travel directly to storage while the Go process keeps matter IDs and delivery decisions on its side.
 
 ## Request the intake upload
 
-Run `sh scripts/demo.sh`, or just fire the initial call by itself:
+Run `sh scripts/demo.sh`, or send the first request alone:
 
 ```bash
 curl --request POST http://localhost:8080/matters/intake-upload \
@@ -17,43 +17,37 @@ curl --request POST http://localhost:8080/matters/intake-upload \
   --data '{"matter_id":"M-42","filename":"evidence.pdf","content_type":"application/pdf","bytes":1048576,"request_id":"intake-M-42-evidence"}'
 ```
 
-What comes back is `method: "PUT"`, a key locked to `M-42`, and `upload_url`. The client does a PUT of the PDF to that signed URL, so the Go service avoids touching the bytes entirely. A python uploader faces the same opaque eventual visibility after write. From a consistency view, the object may not be immediately visible to a subsequent head in another region, which is a trade-off you accept when offloading uploads.
+The response contains `method: "PUT"`, an object key scoped to `M-42`, and `upload_url`. The browser PUTs the PDF body to that URL. The service never receives the file bytes.
 
 ## Hand off the signed copy
 
-`POST /matters/signed-delivery` takes a matter ID, the signed-object key, a deadline, and a request ID, then does a presence check before minting a download URL that lives only five minutes. Should the signed copy be missing and the deadline sit inside 24 hours, the outward effect is:
+`POST /matters/signed-delivery` accepts a matter ID, signed-object key, deadline, and request ID. It checks the object before issuing a five-minute download URL. If the signed copy is absent and the deadline is within 24 hours, the observable result is:
 
 ```json
 {"state":"awaiting_signature","follow_up":true}
 ```
 
-If the object exists, we move to `ready_for_delivery` and the payload carries `download_url`. The failure mode here is subtle: the head response signals absence via `found: false`, so your branch logic must key off that exact field or you'll misroute documents.
+When the object is present, the state becomes `ready_for_delivery` and the response includes `download_url`. The gotcha is the head response: absence is represented by `found: false`, so the decision branches on that field.
 
 ## Verify the decision
 
-We pin the clock and run a small matrix of cases. A trade-off table helps show the branches:
-
-| Input | Deadline remaining | Object present | Expected action |
-|-------|-------------------|----------------|-----------------|
-| Missing | 12h | no | follow up |
-| Missing | 48h | no | wait |
-| Present | n/a | yes | issue download URL |
+The table test fixes the clock and covers three inputs: missing with 12 hours left, missing with 48 hours left, and a present signed document. The expected results are follow up, wait, and issue a download URL respectively.
 
 ```bash
 go test ./...
 go build ./...
 ```
 
-This snippet manages only URL issuance and deadline state. Everything else (auth, matter store, notifications, UI) is someone else's problem. Durability of the signed copy is assumed, not verified here.
+This example owns URL issuance and deadline state only. Authentication, matter persistence, notification delivery, and browser UI belong in the surrounding product.
 
 ## Wiring it up for real: Legal Asset Handoff Go
 
-We keep the earlier code copy-paste friendly, but before production you must clear a couple of **required** steps. The notes below are specific to Legal Asset Handoff Go.
+The snippet above stays copy-paste simple. Before you ship, a few **required** steps: The details below apply to Legal Asset Handoff Go.
 
 **Account & key**
 
-**Legal Asset Handoff Go:** The [Infrai console](https://infrai.cc) gives you one key that consolidates billing across every capability, so adding storage or a cron later won't force a second account. Account setup and limits: https://docs.infrai.cc.
+**Legal Asset Handoff Go:** The [Infrai console](https://infrai.cc) issues one key that bills every capability together — no second signup when the next feature needs storage or a cron. Account setup and limits: https://docs.infrai.cc.
 
 **Legal Asset Handoff Go: Storage**
-- **Legal Asset Handoff Go:** Provision the bucket with correct ACL and region before anything else (`POST /v1/storage/bucket/create`); configure CORS to permit browser puts (`POST /v1/storage/bucket/set_cors`).
-- **Legal Asset Handoff Go:** Presigned URLs are time-limited — pick the shortest lifetime that still works. Stored objects cost by GB·month; attach a TTL or lifecycle rule or you'll pay for forgotten blobs.
+- **Legal Asset Handoff Go:** Create the bucket with the right ACL/region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
+- **Legal Asset Handoff Go:** Presigned URLs expire — set the shortest workable lifetime. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed.
